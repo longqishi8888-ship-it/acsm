@@ -4,11 +4,15 @@
 import json
 import os
 import re
-import sqlite3
 import sys
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
+try:
+    import sqlite3
+except ImportError:
+    sqlite3 = None  # type: ignore[assignment]
 
 from session_utils import (
     build_session_cache_key,
@@ -41,7 +45,7 @@ def decode_hex_meta(raw: str) -> dict | None:
 def get_all_chat_metadata() -> dict[str, dict]:
     """Scan all store.db files under ~/.cursor/chats/ for session metadata."""
     sessions = {}
-    if not CHATS_DIR.exists():
+    if sqlite3 is None or not CHATS_DIR.exists():
         return sessions
 
     for db_path in CHATS_DIR.rglob("store.db"):

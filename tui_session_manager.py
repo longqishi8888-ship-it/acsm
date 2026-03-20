@@ -47,8 +47,16 @@ from textual.widgets import (
     TextArea,
 )
 
-from list_claude_sessions import collect_sessions as collect_claude_sessions
-from list_cursor_sessions import collect_sessions as collect_cursor_sessions
+try:
+    from list_claude_sessions import collect_sessions as collect_claude_sessions
+except Exception:
+    collect_claude_sessions = None  # type: ignore[assignment]
+
+try:
+    from list_cursor_sessions import collect_sessions as collect_cursor_sessions
+except Exception:
+    collect_cursor_sessions = None  # type: ignore[assignment]
+
 from session_utils import (
     extract_user_query,
     format_timestamp,
@@ -83,8 +91,67 @@ def _runtime_state_dir() -> Path:
     return candidates[-1]
 
 
+def _ensure_container_compat() -> None:
+    """Fix environment for containers where locale / TERM are often missing."""
+    lang = os.environ.get("LANG", "")
+    if not lang or "utf" not in lang.lower():
+        for candidate in ("C.UTF-8", "en_US.UTF-8"):
+            os.environ["LANG"] = candidate
+            break
+    if not os.environ.get("LC_ALL"):
+        os.environ["LC_ALL"] = os.environ.get("LANG", "C.UTF-8")
+
+    term = os.environ.get("TERM", "")
+    if not term or term == "dumb":
+        os.environ["TERM"] = "xterm-256color"
+
+    os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+
+
 def _command_exists(command: str) -> bool:
     return shutil.which(command) is not None
+
+
+def _find_cursor_cli() -> str | None:
+    """Return the first available Cursor CLI command name, or None."""
+    for cmd in ("cursor-agent", "agent"):
+        if _command_exists(cmd):
+            return cmd
+    return None
+
+
+def _check_python_deps() -> tuple[list[str], list[str]]:
+    """Probe Python-level dependencies and return (fatal_errors, warnings)."""
+    import importlib
+
+    fatal: list[str] = []
+    warns: list[str] = []
+
+    # Hard requirement: textual (TUI framework).
+    try:
+        importlib.import_module("textual")
+    except Exception:
+        fatal.append("Python package `textual` is not installed.  pip install textual")
+
+    # Optional: sqlite3 (for Cursor chat metadata from store.db).
+    try:
+        importlib.import_module("sqlite3")
+    except Exception:
+        warns.append(
+            "Python `sqlite3` unavailable (libsqlite3 missing?); "
+            "Cursor chat metadata will be skipped.  "
+            "Alpine: apk add sqlite-libs  Debian: apt install libsqlite3-0"
+        )
+
+    # Optional: multiprocessing (parallel session loading).
+    try:
+        importlib.import_module("multiprocessing")
+    except Exception:
+        warns.append(
+            "Python `multiprocessing` unavailable; session loading will be single-threaded."
+        )
+
+    return fatal, warns
 
 
 def _preflight_check(tool: str, *, skip: bool = False) -> bool:
@@ -99,13 +166,30 @@ def _preflight_check(tool: str, *, skip: bool = False) -> bool:
     fatal_errors: list[str] = []
     warnings: list[str] = []
 
-    if not _command_exists("tmux"):
-        fatal_errors.append("Missing required command: tmux")
+    # Python-level deps
+    py_fatal, py_warns = _check_python_deps()
+    fatal_errors.extend(py_fatal)
+    warnings.extend(py_warns)
 
-    if tool in ("claude", "all") and not _command_exists("claude"):
-        warnings.append("`claude` CLI not found; Claude session open/resume will fail.")
-    if tool in ("cursor", "all") and not _command_exists("agent"):
-        warnings.append("`agent` CLI not found; Cursor session open/resume will fail.")
+    # System commands
+    if not _command_exists("tmux"):
+        fatal_errors.append(
+            "Missing required command: tmux.  "
+            "Alpine: apk add tmux  Debian: apt install tmux"
+        )
+
+    if tool in ("claude", "all"):
+        if collect_claude_sessions is None:
+            warnings.append("list_claude_sessions module failed to load; Claude sessions unavailable.")
+        elif not _command_exists("claude"):
+            warnings.append("`claude` CLI not found; Claude session open/resume will fail.")
+    if tool in ("cursor", "all"):
+        if collect_cursor_sessions is None:
+            warnings.append(
+                "list_cursor_sessions module failed to load; Cursor sessions unavailable."
+            )
+        elif not _find_cursor_cli():
+            warnings.append("`agent`/`cursor-agent` CLI not found; Cursor session open/resume will fail.")
 
     if sys.platform == "win32":
         warnings.append(
@@ -116,6 +200,18 @@ def _preflight_check(tool: str, *, skip: bool = False) -> bool:
     if not any(_command_exists(cmd) for cmd in clipboard_cmds):
         warnings.append(
             "No clipboard backend found (wl-copy/xsel/xclip/pbcopy); copy actions may fail."
+        )
+
+    # Locale / encoding sanity (common container issue).
+    import locale
+    try:
+        enc = locale.getpreferredencoding(False)
+    except Exception:
+        enc = ""
+    if enc and "utf" not in enc.lower():
+        warnings.append(
+            f"System encoding is '{enc}', not UTF-8; box-drawing characters may not render.  "
+            "Alpine: apk add musl-locales  Debian: apt install locales && locale-gen en_US.UTF-8"
         )
 
     for warning in warnings:
@@ -148,7 +244,7 @@ def _right_pane_id_path() -> Path:
 # ---------------------------------------------------------------------------
 
 def _tmux(*args: str, capture: bool = False) -> subprocess.CompletedProcess:
-    return subprocess.run(["tmux"] + list(args), capture_output=capture, text=True)
+    return subprocess.run(["tmux", "-u"] + list(args), capture_output=capture, text=True)
 
 
 def _tmux_out(*args: str) -> str:
@@ -162,7 +258,8 @@ def _session_alive(name: str) -> bool:
 def _resume_command(record: "SessionRecord") -> list[str]:
     if record.source == "claude":
         return ["claude", "--resume", record.session_id]
-    return ["agent", "--resume", record.session_id]
+    cli = _find_cursor_cli() or "agent"
+    return [cli, "--resume", record.session_id]
 
 
 def _window_name(source: str, session_id: str) -> str:
@@ -229,7 +326,7 @@ def _ensure_right_pane() -> None:
     right_pane = _tmux_out(
         "split-window", "-d", "-t", TMUX_MAIN, "-h", "-l", "55%",
         "-P", "-F", "#{pane_id}",
-        f"unset TMUX; exec tmux attach-session -t {TMUX_AGENTS}",
+        f"unset TMUX; while true; do tmux -u attach-session -t {TMUX_AGENTS} 2>/dev/null || sleep 1; done",
     )
     if right_pane:
         _save_right_pane_id(right_pane)
@@ -300,12 +397,12 @@ def bootstrap_tmux() -> None:
     right_pane = _tmux_out(
         "split-window", "-t", TMUX_MAIN, "-h", "-l", "55%",
         "-P", "-F", "#{pane_id}",
-        f"unset TMUX; exec tmux attach-session -t {TMUX_AGENTS}",
+        f"unset TMUX; while true; do tmux -u attach-session -t {TMUX_AGENTS} 2>/dev/null || sleep 1; done",
     )
     _save_right_pane_id(right_pane)
     _tmux("select-pane", "-t", f"{TMUX_MAIN}.0")
 
-    os.execvp("tmux", ["tmux", "attach-session", "-t", TMUX_MAIN])
+    os.execvp("tmux", ["tmux", "-u", "attach-session", "-t", TMUX_MAIN])
 
 
 def _agents_window_exists(win_name: str) -> bool:
@@ -347,13 +444,25 @@ def _agents_active_pane_id() -> str | None:
     ) or None
 
 
+def _wrap_agent_cmd(cmd: str) -> str:
+    """Wrap an agent command so the tmux window survives process exit."""
+    return (
+        f"{cmd}; EC=$?; echo; "
+        "echo '-----------------------------------------------'; "
+        "echo \"  Session ended (exit code $EC)\"; "
+        "echo '  Press Enter to close this tab'; "
+        "echo '-----------------------------------------------'; "
+        "read _"
+    )
+
+
 def agents_create_window(win_name: str, cmd: str, cwd: str) -> None:
     """Create a new window in the agents session and switch to it."""
     _ensure_agents_session()
     _ensure_right_pane()
     _tmux(
         "new-window", "-t", TMUX_AGENTS,
-        "-n", win_name, "-c", cwd, cmd,
+        "-n", win_name, "-c", cwd, _wrap_agent_cmd(cmd),
     )
     placeholder_wins = [
         w for w in _agents_list_windows() if w == "placeholder"
@@ -874,9 +983,9 @@ class SessionManagerApp(App):
         rows: list[SessionRecord] = []
         kw = self.keyword.lower() if self.keyword else None
         collectors: list[tuple[str, object]] = []
-        if self.tool in ("claude", "all"):
+        if self.tool in ("claude", "all") and collect_claude_sessions is not None:
             collectors.append(("claude", collect_claude_sessions))
-        if self.tool in ("cursor", "all"):
+        if self.tool in ("cursor", "all") and collect_cursor_sessions is not None:
             collectors.append(("cursor", collect_cursor_sessions))
 
         if len(collectors) == 1:
@@ -1946,6 +2055,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
+    _ensure_container_compat()
     args = parse_args()
     if not _preflight_check(args.tool, skip=args.skip_preflight):
         sys.exit(1)

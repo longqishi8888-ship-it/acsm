@@ -1764,12 +1764,25 @@ class SessionManagerApp(App):
             return "bash"
         return ext_map.get(ext)
 
+    @staticmethod
+    def _detect_csv_delimiter(first_line: str) -> str:
+        """Guess delimiter from the header line by picking the most frequent candidate."""
+        counts = {d: first_line.count(d) for d in ("\t", ";", ",")}
+        best = max(counts, key=counts.get)  # type: ignore[arg-type]
+        return best if counts[best] > 0 else ","
+
     def _show_csv(self, path: str) -> None:
         csv_preview = self.query_one("#csv_preview", TextArea)
-        rows: list[list[str]] = []
         try:
+            rows: list[list[str]] = []
             with open(path, "r", encoding="utf-8", errors="replace") as f:
-                reader = csv.reader(f)
+                first_line = f.readline()
+                if not first_line.strip():
+                    csv_preview.load_text("Empty CSV")
+                    return
+                delim = self._detect_csv_delimiter(first_line)
+                f.seek(0)
+                reader = csv.reader(f, delimiter=delim)
                 headers = next(reader, None)
                 if not headers:
                     csv_preview.load_text("Empty CSV")
@@ -1782,10 +1795,48 @@ class SessionManagerApp(App):
         except Exception as e:
             self._show_text_preview(f"CSV error: {e}")
             return
-        rendered = "\n".join("\t".join(col for col in row) for row in rows)
+
+        num_cols = max(len(r) for r in rows) if rows else 0
+        for r in rows:
+            r.extend([""] * (num_cols - len(r)))
+
+        def _display_width(s: str) -> int:
+            import unicodedata
+            w = 0
+            for ch in s:
+                eaw = unicodedata.east_asian_width(ch)
+                w += 2 if eaw in ("W", "F") else 1
+            return w
+
+        def _truncate(s: str, width: int) -> str:
+            w = 0
+            for i, ch in enumerate(s):
+                import unicodedata
+                eaw = unicodedata.east_asian_width(ch)
+                cw = 2 if eaw in ("W", "F") else 1
+                if w + cw > width:
+                    return s[:i] + "…"
+                w += cw
+            return s
+
+        def _pad(s: str, width: int) -> str:
+            return s + " " * max(0, width - _display_width(s))
+
+        max_col_width = 60
+        col_widths = [
+            min(max_col_width, max(_display_width(r[c]) for r in rows))
+            for c in range(num_cols)
+        ]
+        lines: list[str] = []
+        for idx, row in enumerate(rows):
+            cells = [_pad(_truncate(col, col_widths[c]), col_widths[c]) for c, col in enumerate(row)]
+            lines.append("  ".join(cells))
+            if idx == 0:
+                lines.append("  ".join("-" * w for w in col_widths))
+
         csv_preview.language = None
         csv_preview.soft_wrap = self._csv_wrap
-        csv_preview.load_text(rendered)
+        csv_preview.load_text("\n".join(lines))
         self._preview_language = "csv"
         tabs = self.query_one("#file_tabs", TabbedContent)
         tabs.active = "tab_csv"
